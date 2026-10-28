@@ -1,0 +1,122 @@
+The feature engineering pipeline is implemented in 
+
+feature_engineering.py
+.
+
+Raw transaction data contains only point-in-time snapshots (amount, oldbalance, newbalance). This pipeline transforms raw data into behavioral, ledger-auditing, and network-graph features that capture how fraudsters actually behave.
+
+1. Pipeline Stages Overview
+ [ Raw PaySim DataFrame ]
+            │
+            ├─► 1. Categorical Encoding (One-Hot on Transaction Type)
+            │
+            ├─► 2. Ledger Arithmetic & Drainage Auditing
+            │
+            ├─► 3. Sender Behavioral Profiling (Baseline vs Outlier)
+            │
+            ├─► 4. Destination Graph & Mule Network Tracking
+            │
+            ├─► 5. Sanitization & Type Conversion (NaNs, Zero-Div, Booleans)
+            │
+            ▼
+ [ Feature Matrix (X) ] ──► Excludes IDs & Targets ──► XGBoost / SHAP
+2. Detailed Breakdown of Pipeline Stages
+Stage 1: Transaction Type One-Hot Encoding (
+
+L13-L14
+)
+python
+df = pd.get_dummies(df, columns=["type"], prefix="type")
+Output columns: type_CASH_IN, type_CASH_OUT, type_DEBIT, type_PAYMENT, type_TRANSFER.
+Domain Significance: Fraud in mobile money almost exclusively occurs during TRANSFER (unauthorized movement of funds) and CASH_OUT (liquidation). One-hot encoding allows the tree model to isolate these risk-bearing transaction types immediately.
+Stage 2: Ledger Arithmetic & Balance Drainage (
+
+L16-L25
+)
+Fraudulent transactions often tamper with balances or exhibit distinct balance anomalies:
+
+Engineered Feature	Logic	Why It Detects Fraud
+balance_mismatch_orig	abs(oldbalanceOrg - amount - newbalanceOrig) > 0.01	Accounting Inconsistency: Checks whether the sender's balance was deducted by exactly amount. In fraud scenarios, balance changes often fail to match the transaction amount due to forced overrides or data anomalies.
+balance_mismatch_dest	abs(oldbalanceDest + amount - newbalanceDest) > 0.01	Destination Ledger Discrepancy: Checks whether recipient balance grew by amount. Many fraud cases show $0 \to 0$ balances or instant cash-outs.
+is_balance_drained	(oldbalanceOrg > 0) & (newbalanceOrig == 0)	Total Account Siphoning: Legitimate users rarely drain an account balance to exactly zero in a single transaction; fraudsters systematically drain 100% of available funds.
+Stage 3: Sender Behavioral Profiling (
+
+L27-L34
+)
+Fraud often presents as an abrupt deviation from a user’s historical baseline:
+
+python
+sender_stats = df.groupby("nameOrig")["amount"].agg(["mean", "count"])
+sender_stats.columns = ["sender_avg_amount", "sender_txn_count"]
+df = df.merge(sender_stats, on="nameOrig", how="left")
+df["amount_to_sender_avg_ratio"] = df["amount"] / df["sender_avg_amount"].replace(0, np.nan)
+df["amount_to_sender_avg_ratio"] = df["amount_to_sender_avg_ratio"].fillna(1.0)
+sender_avg_amount: The sender's historical average transaction value.
+sender_txn_count: Frequency of transactions for this sender (distinguishes established accounts from newly minted accounts).
+amount_to_sender_avg_ratio: A spike multiplier. For example, if a user usually transacts $$100$, an abrupt $$10,000$ transfer results in a ratio of $100.0$, creating a strong outlier signal.
+Stage 4: Destination Graph & Mule Network Tracking (
+
+L36-L46
+)
+Fraudsters route stolen funds through intermediary accounts (money mules):
+
+python
+dest_stats = df.groupby("nameDest").agg(
+    dest_in_degree=("amount", "count"),
+    dest_total_inflow=("amount", "sum"),
+)
+df = df.merge(dest_stats, on="nameDest", how="left")
+drained_origins = set(df.loc[df["is_balance_drained"], "nameOrig"])
+df["dest_is_drained_account"] = df["nameDest"].isin(drained_origins)
+dest_in_degree: In-degree centrality (number of unique transactions sent to this destination). Funnel accounts receiving funds from dozens of senders are typical fraud hubs.
+dest_total_inflow: Cumulative volume received by this destination.
+dest_is_drained_account: A graph-link proxy. It checks if the recipient account ID (nameDest) was also observed acting as an origin account (nameOrig) where funds were subsequently drained. This directly flags mule relay chains (Compromised Account $\to$ Mule Account $\to$ Cash Out).
+Stage 5: Sanitization & Casting (
+
+L48-L50
+)
+Replaces division-by-zero occurrences with 1.0 (neutral baseline ratio).
+Converts all boolean flags (balance_mismatch_*, is_balance_drained, dest_is_drained_account) to int (0 or 1) for tree-based algorithm compatibility.
+Stage 6: Feature Selection & Leakage Prevention (
+
+L54-L56
+)
+python
+def get_feature_columns(df):
+    exclude = {"nameOrig", "nameDest", "isFraud", "isFlaggedFraud"}
+    return [c for c in df.columns if c not in exclude]
+Excludes Identifiers (nameOrig, nameDest): High-cardinality strings that would cause the tree model to overfit on specific account IDs rather than learning generalizable behavioral patterns.
+Excludes Targets & Naive Rules (isFraud, isFlaggedFraud): Prevents data leakage into the training feature matrix.
+3. Final Feature Set Used by XGBoost & SHAP
+The resulting feature matrix includes 19 features:
+
+Time/Sequence: step
+Transaction Attributes: amount, oldbalanceOrg, newbalanceOrig, oldbalanceDest, newbalanceDest
+One-Hot Types: type_CASH_IN, type_CASH_OUT, type_DEBIT, type_PAYMENT, type_TRANSFER
+Ledger Discrepancies: balance_mismatch_orig, balance_mismatch_dest, is_balance_drained
+Sender Profiling: sender_avg_amount, sender_txn_count, amount_to_sender_avg_ratio
+Mule/Network Graph: dest_in_degree, dest_total_inflow, dest_is_drained_account
+These features are cached to 
+
+paysim_features.parquet
+ for high-speed columnar retrieval by the FastAPI backend.
+
+8:30 AM
+
+
+
+
+
+step,type,amount,nameOrig,oldbalanceOrg,newbalanceOrig,nameDest,oldbalanceDest,newbalanceDest,isFraud,isFlaggedFraud
+1,PAYMENT,9839.64,C1231006815,170136.0,160296.36,M1979787155,0.0,0.0,0,0
+1,PAYMENT,1864.28,C1666544295,21249.0,19384.72,M2044282225,0.0,0.0,0,0
+1,TRANSFER,181.0,C1305486145,181.0,0.0,C553264065,0.0,0.0,1,0
+1,CASH_OUT,181.0,C840083671,181.0,0.0,C38997010,21182.0,0.0,1,0
+1,PAYMENT,11668.14,C2048537720,41554.0,29885.86,M1230701703,0.0,0.0,0,0
+1,PAYMENT,7817.71,C90045638,53860.0,46042.29,M573487274,0.0,0.0,0,0
+1,PAYMENT,7107.77,C154988899,183195.0,176087.23,M408069119,0.0,0.0,0,0
+1,PAYMENT,7861.64,C1912850431,176087.23,168225.59,M633326333,0.0,0.0,0,0
+1,PAYMENT,4024.36,C1265012928,2671.0,0.0,M1176932104,0.0,0.0,0,0
+1,DEBIT,5337.77,C712410124,41720.0,36382.23,C195600860,41898.0,40348.79,0,0
+1,DEBIT,9644.94,C1900366749,4465.0,0.0,C997608398,10845.0,157982.12,0,0
+1,PAYMENT,3099.97,C249177573,20771.0,17671.03,M2096539129,0.0,0.0,0,0
